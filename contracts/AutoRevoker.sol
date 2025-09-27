@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-import "./interfaces/IERC20.sol";
-import "./interfaces/IERC721.sol";
-import "./interfaces/IAutoRevoker.sol";
+import "./IERC20.sol";
+import "./IERC721.sol";
+import "./IAutoRevoker.sol";
 
-/**
- * @title AutoRevoker
- * @dev Automated token approval revocation via delegation
- */
 contract AutoRevoker is IAutoRevoker {
     struct DelegationInfo {
         address delegator;
@@ -124,83 +120,24 @@ contract AutoRevoker is IAutoRevoker {
         emit DelegationRevoked(smartAccount, delegation.agent, block.timestamp);
     }
 
-    function revokeERC20Approval(
-        address smartAccount,
-        address token,
-        address spender,
-        string calldata reason
-    ) external override onlyAuthorizedAgent(smartAccount) whenNotPaused {
-        uint256 currentAllowance = IERC20(token).allowance(smartAccount, spender);
-        require(currentAllowance > 0, "AutoRevoker: No approval exists");
-
-        IERC20(token).approve(spender, 0);
-
-        revocationCount++;
-        emit ApprovalRevoked(token, smartAccount, spender, currentAllowance, reason);
+    function isDelegationActive(address smartAccount) external view override returns (bool) {
+        DelegationInfo memory delegation = delegations[smartAccount];
+        return delegation.active && block.timestamp <= delegation.expiry;
     }
 
-    function revokeERC721Approval(
-        address smartAccount,
-        address nft,
-        address spender,
-        string calldata reason
-    ) external override onlyAuthorizedAgent(smartAccount) whenNotPaused {
-        require(
-            IERC721(nft).isApprovedForAll(smartAccount, spender),
-            "AutoRevoker: No approval exists"
-        );
-
-        IERC721(nft).setApprovalForAll(spender, false);
-
-        revocationCount++;
-        emit ApprovalRevoked(nft, smartAccount, spender, 0, reason);
+    function getDelegationInfo(address smartAccount) 
+        external view override 
+        returns (address agent, uint256 expiry, bool active) 
+    {
+        DelegationInfo memory delegation = delegations[smartAccount];
+        return (delegation.agent, delegation.expiry, delegation.active);
     }
 
-    function batchRevokeApprovals(
-        address smartAccount,
-        address[] calldata tokens,
-        address[] calldata spenders,
-        bool[] calldata isERC721,
-        string[] calldata reasons
-    ) external override onlyAuthorizedAgent(smartAccount) whenNotPaused {
-        require(
-            tokens.length == spenders.length &&
-            tokens.length == isERC721.length &&
-            tokens.length == reasons.length,
-            "AutoRevoker: Array length mismatch"
-        );
-
-        for (uint256 i = 0; i < tokens.length; i++) {
-            if (isERC721[i]) {
-                if (IERC721(tokens[i]).isApprovedForAll(smartAccount, spenders[i])) {
-                    IERC721(tokens[i]).setApprovalForAll(spenders[i], false);
-                    emit ApprovalRevoked(tokens[i], smartAccount, spenders[i], 0, reasons[i]);
-                    revocationCount++;
-                }
-            } else {
-                uint256 allowance = IERC20(tokens[i]).allowance(smartAccount, spenders[i]);
-                if (allowance > 0) {
-                    IERC20(tokens[i]).approve(spenders[i], 0);
-                    emit ApprovalRevoked(tokens[i], smartAccount, spenders[i], allowance, reasons[i]);
-                    revocationCount++;
-                }
-            }
-        }
-    }
-
-    function emergencyRevoke(
-        address smartAccount,
-        address token,
-        address spender,
-        bool isERC721,
-        string calldata reason
-    ) external onlyOwner {
-        if (isERC721) {
-            IERC721(token).setApprovalForAll(spender, false);
-        } else {
-            IERC20(token).approve(spender, 0);
-        }
-        emit EmergencyRevocation(smartAccount, token, spender, reason);
+    function getStats() 
+        external view 
+        returns (uint256 totalDelegations, uint256 totalRevocations, bool contractPaused) 
+    {
+        return (delegationCount, revocationCount, paused);
     }
 
     function updateRiskRule(
@@ -221,76 +158,6 @@ contract AutoRevoker is IAutoRevoker {
         emit RiskRuleUpdated(contractAddress, isBlacklisted, maxApprovalTime, riskScore);
     }
 
-    function recordApproval(
-        address owner,
-        address token,
-        address spender,
-        uint256 amount,
-        bool isERC721
-    ) external onlyOwner {
-        approvalTimestamps[owner][spender] = block.timestamp;
-
-        userApprovals[owner].push(ApprovalInfo({
-            token: token,
-            spender: spender,
-            timestamp: block.timestamp,
-            amount: amount,
-            isERC721: isERC721,
-            revoked: false
-        }));
-
-        emit ApprovalDetected(owner, token, spender, amount, isERC721);
-    }
-
-    function isDelegationActive(address smartAccount) external view override returns (bool) {
-        DelegationInfo memory delegation = delegations[smartAccount];
-        return delegation.active && block.timestamp <= delegation.expiry;
-    }
-
-    function getDelegationInfo(address smartAccount)
-        external view override
-        returns (address agent, uint256 expiry, bool active)
-    {
-        DelegationInfo memory delegation = delegations[smartAccount];
-        return (delegation.agent, delegation.expiry, delegation.active);
-    }
-
-    function getRiskAssessment(address contractAddress)
-        external view
-        returns (bool isBlacklisted, uint256 riskScore, uint256 maxApprovalTime)
-    {
-        RiskRule memory rule = riskRules[contractAddress];
-        return (rule.isBlacklisted, rule.riskScore, rule.maxApprovalTime);
-    }
-
-    function getApprovalHistory(address user)
-        external view
-        returns (ApprovalInfo[] memory)
-    {
-        return userApprovals[user];
-    }
-
-    function shouldAutoRevoke(address owner, address spender)
-        external view
-        returns (bool shouldRevoke, string memory reason)
-    {
-        RiskRule memory rule = riskRules[spender];
-
-        if (rule.isBlacklisted) {
-            return (true, "Contract is blacklisted");
-        }
-        if (rule.riskScore >= HIGH_RISK_THRESHOLD) {
-            return (true, "High risk contract detected");
-        }
-        if (rule.maxApprovalTime > 0) {
-            uint256 approvalTime = approvalTimestamps[owner][spender];
-            if (approvalTime > 0 && block.timestamp > approvalTime + rule.maxApprovalTime) {
-                return (true, "Approval time limit exceeded");
-            }
-        }
-        return (false, "");
-    }
-
     function pause() external onlyOwner {
         paused = true;
     }
@@ -301,12 +168,5 @@ contract AutoRevoker is IAutoRevoker {
 
     function transferOwnership(address newOwner) external onlyOwner validAddress(newOwner) {
         owner = newOwner;
-    }
-
-    function getStats()
-        external view
-        returns (uint256 totalDelegations, uint256 totalRevocations, bool contractPaused)
-    {
-        return (delegationCount, revocationCount, paused);
     }
 }
